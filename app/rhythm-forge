@@ -1,0 +1,5 @@
+#!/bin/bash
+set -euo pipefail
+
+rhythm_forge_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+exec python3 "$rhythm_forge_dir/rhythm_forge.py" "$@"

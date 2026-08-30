@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.itsvoid-tv.rhythm-forge",
+  "name": "Rhythm Forge",
+  "version": "1.0.11",
+  "author": "Tom Baltes (@itsVoid-TV)",
+  "description": "Turn a music-video link into a one-key rhythm game",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Rhythm Forge",
+    "description": "Launch a rhythm game from any yt-dlp-supported music-video URL",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
