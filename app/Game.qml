@@ -44,6 +44,12 @@ ApplicationWindow {
     property real spamFirstDelta: 0
     property int spamBonusTaps: 0
     property int spamBonusScore: 0
+    property int spamPeakHits: 0
+    property real spamFlash: 0
+    property real holdProgress: 0
+    property real holdLastTickAt: 0
+    property int holdBonusTicks: 0
+    property int holdBonusScore: 0
     property bool mediaPrepared: false
     property bool countdownActive: false
     property int countdownValue: 3
@@ -57,12 +63,22 @@ ApplicationWindow {
     property var exclusiveRewards: [
         { "category": "spam", "id": "eventAurora", "name": "Event Aurora", "color": "#2dffe2" },
         { "category": "hold", "id": "eventCrimson", "name": "Event Crimson", "color": "#ff315f" },
-        { "category": "lane", "id": "eventSolar", "name": "Event Solar", "color": "#ff9d2d" }
+        { "category": "lane", "id": "eventSolar", "name": "Event Solar", "color": "#ff9d2d" },
+        { "category": "background", "id": "eventEclipse", "name": "Event Eclipse", "color": "#b184ff" }
     ]
     property var colorCatalog: ({
-        "spamDefault": "#ffb83f", "spamBlue": "#4d9cff", "spamPink": "#ff5fd2", "spamGreen": "#58e38c", "spamPurple": "#aa70ff", "spamWhite": "#f4f5fb", "spamRed": "#ff5c6f", "eventAurora": "#2dffe2",
-        "holdDefault": "#70edc2", "holdRed": "#ff526f", "holdGold": "#ffc857", "holdBlue": "#4d9cff", "holdPurple": "#b477ff", "holdWhite": "#f4f5fb", "holdOrange": "#ff9d45", "eventCrimson": "#ff315f",
-        "laneDefault": "#8a70ff", "laneYellow": "#ffe14d", "laneIce": "#62d9ff", "laneGreen": "#5ee6a8", "laneRed": "#ff5a70", "laneWhite": "#f4f5fb", "lanePink": "#ff70c8", "eventSolar": "#ff9d2d"
+        "spamDefault": "#ffb83f", "spamBlue": "#4d9cff", "spamPink": "#ff5fd2", "spamGreen": "#58e38c", "spamPurple": "#aa70ff", "spamWhite": "#f4f5fb", "spamRed": "#ff5c6f", "spamCyan": "#27e5ff", "spamGold": "#ffd34e", "spamLime": "#b7ff4a", "eventAurora": "#2dffe2",
+        "holdDefault": "#70edc2", "holdRed": "#ff526f", "holdGold": "#ffc857", "holdBlue": "#4d9cff", "holdPurple": "#b477ff", "holdWhite": "#f4f5fb", "holdOrange": "#ff9d45", "holdCyan": "#33e6ff", "holdPink": "#ff6fd8", "holdLime": "#b5f56a", "eventCrimson": "#ff315f",
+        "laneDefault": "#8a70ff", "laneYellow": "#ffe14d", "laneIce": "#62d9ff", "laneGreen": "#5ee6a8", "laneRed": "#ff5a70", "laneWhite": "#f4f5fb", "lanePink": "#ff70c8", "laneOrange": "#ff9a3d", "lanePurple": "#b77bff", "laneCyan": "#3cf2e3", "eventSolar": "#ff9d2d"
+    })
+    property var backgroundCatalog: ({
+        "backgroundDefault": { "top": "#090b13", "middle": "#151126", "bottom": "#090b13", "accent": "#8a70ff", "opacity": 0.28, "grid": 0.08 },
+        "backgroundMidnight": { "top": "#080a25", "middle": "#211a55", "bottom": "#080b1b", "accent": "#6657d9", "opacity": 0.62, "grid": 0.15 },
+        "backgroundNebula": { "top": "#18091f", "middle": "#5a2478", "bottom": "#130a2f", "accent": "#d25cff", "opacity": 0.58, "grid": 0.10 },
+        "backgroundOcean": { "top": "#061724", "middle": "#0f4961", "bottom": "#071425", "accent": "#35d7ff", "opacity": 0.58, "grid": 0.12 },
+        "backgroundEmber": { "top": "#1e0909", "middle": "#6b241c", "bottom": "#180b13", "accent": "#ff7048", "opacity": 0.58, "grid": 0.10 },
+        "backgroundMono": { "top": "#101116", "middle": "#2a2d37", "bottom": "#0b0c10", "accent": "#c9cedd", "opacity": 0.64, "grid": 0.09 },
+        "eventEclipse": { "top": "#090512", "middle": "#25143f", "bottom": "#05020b", "accent": "#b184ff", "opacity": 0.66, "grid": 0.16 }
     })
     property var heldHitKeys: ({})
     property int holdInputKey: 0
@@ -71,6 +87,7 @@ ApplicationWindow {
     readonly property color spamColor: colorCatalog[progressionSettings.equippedSpam] || colorCatalog.spamDefault
     readonly property color holdColor: colorCatalog[progressionSettings.equippedHold] || colorCatalog.holdDefault
     readonly property color laneColor: colorCatalog[progressionSettings.equippedLane] || colorCatalog.laneDefault
+    readonly property var backgroundTheme: backgroundCatalog[progressionSettings.equippedBackground] || backgroundCatalog.backgroundDefault
 
     function safeExternalText(value, fallback, limit) {
         var raw = value === undefined || value === null ? "" : String(value)
@@ -135,7 +152,8 @@ ApplicationWindow {
     function ownedString(category) {
         if (category === "spam") return progressionSettings.ownedSpam
         if (category === "hold") return progressionSettings.ownedHold
-        return progressionSettings.ownedLane
+        if (category === "lane") return progressionSettings.ownedLane
+        return progressionSettings.ownedBackground
     }
 
     function isOwned(category, colorId) {
@@ -145,14 +163,16 @@ ApplicationWindow {
     function equippedColor(category) {
         if (category === "spam") return progressionSettings.equippedSpam
         if (category === "hold") return progressionSettings.equippedHold
-        return progressionSettings.equippedLane
+        if (category === "lane") return progressionSettings.equippedLane
+        return progressionSettings.equippedBackground
     }
 
     function addOwned(category, colorId) {
         if (isOwned(category, colorId)) return
         if (category === "spam") progressionSettings.ownedSpam += colorId + "|"
         else if (category === "hold") progressionSettings.ownedHold += colorId + "|"
-        else progressionSettings.ownedLane += colorId + "|"
+        else if (category === "lane") progressionSettings.ownedLane += colorId + "|"
+        else progressionSettings.ownedBackground += colorId + "|"
     }
 
     function calculateSongStars() {
@@ -216,11 +236,38 @@ ApplicationWindow {
     }
 
     function awardSpamBonus() {
-        var points = Math.round(125 * (1.0 + Math.min(1.0, combo / 50.0)))
+        var note = nextNote < notes.length ? notes[nextNote] : { "taps": spamHits }
+        var extraTap = Math.max(1, spamHits - Number(note.taps || 0))
+        var base = 100 + Math.min(200, (extraTap - 1) * 20)
+        var points = Math.round(base * (1.0 + Math.min(1.0, combo / 50.0)))
         score += points
         spamBonusTaps += 1
         spamBonusScore += points
         return points
+    }
+
+    function awardHoldTicks(count) {
+        var boundedCount = Math.max(0, Math.min(16, Math.floor(count)))
+        if (boundedCount === 0) return
+        var points = Math.round(60 * (1.0 + Math.min(1.0, combo / 50.0))) * boundedCount
+        score += points
+        holdBonusTicks += boundedCount
+        holdBonusScore += points
+    }
+
+    function updateActiveHold(now, note) {
+        if (!holdActive) return
+        var start = note.start * 1000
+        var end = note.end * 1000
+        var cappedNow = Math.min(now, end)
+        holdProgress = Math.max(0, Math.min(1, (cappedNow - start) / Math.max(1, end - start)))
+        var pendingTicks = Math.max(0, Math.min(16, Math.floor((cappedNow - holdLastTickAt) / 250)))
+        awardHoldTicks(pendingTicks)
+        holdLastTickAt += pendingTicks * 250
+        if (now < end) {
+            judgement = "HOLD  " + Math.round(holdProgress * 100) + "%"
+            judgementColor = holdColor
+        }
     }
 
     function acceptPress(wallTime) {
@@ -238,6 +285,8 @@ ApplicationWindow {
         spamFirstDelta = 0
         holdActive = false
         holdStartResult = null
+        holdProgress = 0
+        holdLastTickAt = 0
     }
 
     function pressHitKey(key) {
@@ -275,20 +324,24 @@ ApplicationWindow {
             } else {
                 if (spamHits === 0) spamFirstDelta = delta
                 spamHits += 1
+                spamPeakHits = Math.max(spamPeakHits, spamHits)
+                spamPulse.restart()
                 if (spamHits > note.taps && now <= note.end * 1000) {
                     var bonus = awardSpamBonus()
                     judgement = "SPAM BONUS  +" + bonus
                 } else {
                     judgement = "SPAM  " + Math.min(spamHits, note.taps) + " / " + note.taps
                 }
-                judgementColor = "#ffcf67"
+                judgementColor = spamColor
             }
         } else if (note.type === "hold") {
             if (Math.abs(delta) <= 200 && !holdActive) {
                 holdActive = true
                 holdStartResult = timingLabel(delta)
-                judgement = "HOLD"
-                judgementColor = "#70edc2"
+                holdLastTickAt = Math.max(note.start * 1000, now)
+                holdProgress = Math.max(0, Math.min(1, delta / Math.max(1, (note.end - note.start) * 1000)))
+                judgement = "HOLD  " + Math.round(holdProgress * 100) + "%"
+                judgementColor = holdColor
             } else {
                 registerOverhit()
             }
@@ -307,10 +360,11 @@ ApplicationWindow {
         if (!holdActive || nextNote >= notes.length) return
         var note = notes[nextNote]
         var now = player.position + offsetMs
+        updateActiveHold(now, note)
         if (now >= note.end * 1000 - 200) finishNote(holdStartResult)
         else finishNote(null)
         judgement = now >= note.end * 1000 - 200 ? "HOLD COMPLETE" : "RELEASED EARLY"
-        judgementColor = now >= note.end * 1000 - 200 ? "#70edc2" : "#ff718d"
+        judgementColor = now >= note.end * 1000 - 200 ? holdColor : "#ff718d"
         judgementFade.restart()
         playfield.requestPaint()
     }
@@ -322,10 +376,11 @@ ApplicationWindow {
         while (nextNote < notes.length) {
             var note = notes[nextNote]
             if (note.type === "hold" && holdActive) {
+                updateActiveHold(now, note)
                 if (now >= note.end * 1000) {
                     finishNote(holdStartResult)
                     judgement = "HOLD COMPLETE"
-                    judgementColor = "#70edc2"
+                    judgementColor = holdColor
                     changed = true
                     continue
                 }
@@ -336,7 +391,7 @@ ApplicationWindow {
             if (note.type === "spam" && spamHits >= note.taps) {
                 finishNote(timingLabel(spamFirstDelta))
                 judgement = "SPAM COMPLETE"
-                judgementColor = "#ffcf67"
+                judgementColor = spamColor
             } else {
                 finishNote(null)
                 judgement = "MISS"
@@ -439,9 +494,11 @@ ApplicationWindow {
         property string ownedSpam: "|spamDefault|"
         property string ownedHold: "|holdDefault|"
         property string ownedLane: "|laneDefault|"
+        property string ownedBackground: "|backgroundDefault|"
         property string equippedSpam: "spamDefault"
         property string equippedHold: "holdDefault"
         property string equippedLane: "laneDefault"
+        property string equippedBackground: "backgroundDefault"
     }
 
     Timer {
@@ -509,7 +566,49 @@ ApplicationWindow {
 
     Rectangle {
         anchors.fill: parent
-        color: "#50090b13"
+        opacity: Number(root.backgroundTheme.opacity || 0.28)
+        gradient: Gradient {
+            orientation: Gradient.Vertical
+            GradientStop { position: 0.0; color: root.backgroundTheme.top || "#090b13" }
+            GradientStop { position: 0.52; color: root.backgroundTheme.middle || "#151126" }
+            GradientStop { position: 1.0; color: root.backgroundTheme.bottom || "#090b13" }
+        }
+    }
+
+    Item {
+        anchors.fill: parent
+        opacity: Number(root.backgroundTheme.grid || 0.08)
+        Repeater {
+            model: 11
+            Rectangle {
+                required property int index
+                x: (parent.width / 12) * (index + 1)
+                width: 1
+                height: parent.height
+                color: root.backgroundTheme.accent || root.laneColor
+            }
+        }
+        Repeater {
+            model: 7
+            Rectangle {
+                required property int index
+                y: (parent.height / 8) * (index + 1)
+                width: parent.width
+                height: 1
+                color: root.backgroundTheme.accent || root.laneColor
+            }
+        }
+    }
+
+    Rectangle {
+        anchors.fill: parent
+        color: "#3f090b13"
+    }
+
+    Rectangle {
+        anchors.fill: parent
+        color: root.spamColor
+        opacity: root.spamFlash * 0.10
     }
 
     Canvas {
@@ -552,18 +651,55 @@ ApplicationWindow {
                     var bottom = Math.max(y, endY)
                     var blockHeight = Math.max(36, bottom - top + 22)
                     var blockY = top - 11
+                    var typeColor = note.type === "spam" ? root.spamColor : root.holdColor
                     ctx.globalAlpha = 0.42
-                    ctx.fillStyle = note.type === "spam" ? root.spamColor : root.holdColor
+                    ctx.fillStyle = typeColor
                     ctx.fillRect(centerX - noteWidth / 2 - 7, blockY - 7, noteWidth + 14, blockHeight + 14)
-                    ctx.globalAlpha = 0.94
-                    ctx.fillStyle = note.type === "spam" ? root.spamColor : root.holdColor
+                    ctx.globalAlpha = note.type === "hold" ? 0.58 : 0.92
+                    ctx.fillStyle = typeColor
                     ctx.fillRect(centerX - noteWidth / 2, blockY, noteWidth, blockHeight)
+
+                    if (note.type === "hold") {
+                        var holdFill = index === root.nextNote && root.holdActive ? root.holdProgress : 0
+                        if (holdFill > 0) {
+                            var fillHeight = blockHeight * holdFill
+                            ctx.globalAlpha = 1.0
+                            ctx.fillStyle = typeColor
+                            ctx.fillRect(centerX - noteWidth / 2, blockY + blockHeight - fillHeight, noteWidth, fillHeight)
+                        }
+                        ctx.globalAlpha = 0.70
+                        ctx.fillStyle = "#ffffffff"
+                        for (var tick = 1; tick < 4; ++tick) {
+                            var tickY = blockY + blockHeight * tick / 4
+                            ctx.fillRect(centerX - noteWidth / 2 + 10, tickY, noteWidth - 20, 2)
+                        }
+                    } else {
+                        var segmentCount = Math.min(16, Math.max(1, Number(note.taps || 1)))
+                        var completedSegments = index === root.nextNote
+                            ? Math.min(segmentCount, Math.ceil(root.spamHits / Math.max(1, Number(note.taps || 1)) * segmentCount))
+                            : 0
+                        var segmentGap = 3
+                        var segmentWidth = (noteWidth - (segmentCount + 1) * segmentGap) / segmentCount
+                        for (var segment = 0; segment < segmentCount; ++segment) {
+                            ctx.globalAlpha = segment < completedSegments ? 1.0 : 0.28
+                            ctx.fillStyle = segment < completedSegments ? "#ffffffff" : "#ff111522"
+                            ctx.fillRect(
+                                centerX - noteWidth / 2 + segmentGap + segment * (segmentWidth + segmentGap),
+                                blockY + blockHeight - 10,
+                                segmentWidth,
+                                5
+                            )
+                        }
+                    }
                     ctx.globalAlpha = 1.0
                     ctx.fillStyle = "#ff111522"
                     ctx.font = "bold 19px sans-serif"
                     ctx.textAlign = "center"
                     ctx.textBaseline = "middle"
-                    ctx.fillText(note.type === "spam" ? "SPAM" : "HOLD", centerX, blockY + blockHeight / 2)
+                    var noteLabel = note.type === "spam"
+                        ? (index === root.nextNote && root.spamHits > 0 ? "SPAM  " + root.spamHits + " / " + note.taps : "SPAM  ×" + note.taps)
+                        : (index === root.nextNote && root.holdActive ? "HOLD  " + Math.round(root.holdProgress * 100) + "%" : "HOLD")
+                    ctx.fillText(noteLabel, centerX, blockY + blockHeight / 2)
                 } else {
                     ctx.fillStyle = "#6f8668ff"
                     ctx.fillRect(centerX - noteWidth / 2 - 7, y - 14, noteWidth + 14, 28)
@@ -614,6 +750,15 @@ ApplicationWindow {
         from: 1
         to: 0
         duration: 700
+    }
+
+    NumberAnimation {
+        id: spamPulse
+        target: root
+        property: "spamFlash"
+        from: 1
+        to: 0
+        duration: 170
     }
 
     RowLayout {
@@ -707,7 +852,7 @@ ApplicationWindow {
         z: 20
         anchors.centerIn: parent
         width: 500
-        height: root.activeEvent.active ? 500 : 450
+        height: root.activeEvent.active ? 560 : 510
         radius: 20
         color: "#f0191c2b"
         border.color: "#708a70ff"
@@ -724,8 +869,11 @@ ApplicationWindow {
                 font.bold: true
                 anchors.horizontalCenter: parent.horizontalCenter
             }
-            Label { text: "SPAM bonus taps  " + root.spamBonusTaps; color: "#ffcf67"; anchors.horizontalCenter: parent.horizontalCenter }
-            Label { text: "SPAM bonus points  +" + root.spamBonusScore.toLocaleString(Qt.locale("en_US"), "f", 0); color: "#ffcf67"; anchors.horizontalCenter: parent.horizontalCenter }
+            Label { text: "Best SPAM burst  " + root.spamPeakHits + " taps"; color: root.spamColor; anchors.horizontalCenter: parent.horizontalCenter }
+            Label { text: "SPAM bonus taps  " + root.spamBonusTaps; color: root.spamColor; anchors.horizontalCenter: parent.horizontalCenter }
+            Label { text: "SPAM bonus points  +" + root.spamBonusScore.toLocaleString(Qt.locale("en_US"), "f", 0); color: root.spamColor; anchors.horizontalCenter: parent.horizontalCenter }
+            Label { text: "HOLD ticks  " + root.holdBonusTicks; color: root.holdColor; anchors.horizontalCenter: parent.horizontalCenter }
+            Label { text: "HOLD bonus points  +" + root.holdBonusScore.toLocaleString(Qt.locale("en_US"), "f", 0); color: root.holdColor; anchors.horizontalCenter: parent.horizontalCenter }
             Label { text: "Extra taps  " + root.overhits; color: "#c4c8da"; anchors.horizontalCenter: parent.horizontalCenter }
             Label {
                 visible: root.activeEvent.active
@@ -770,7 +918,7 @@ ApplicationWindow {
                     Rectangle { width: 36; height: 36; radius: 8; color: root.activeEvent.color || "#ffe14d" }
                     Label { text: "Reward: " + (root.activeEvent.name || "Exclusive Color"); color: root.activeEvent.color || "#ffe14d"; font.pixelSize: 20; font.bold: true; anchors.verticalCenter: parent.verticalCenter }
                 }
-                Label { text: "Event colors cannot be purchased on the song-selection shop."; color: "#aeb4ca"; anchors.horizontalCenter: parent.horizontalCenter }
+                Label { text: "Event-exclusive colors and themes cannot be purchased in the Shop."; color: "#aeb4ca"; anchors.horizontalCenter: parent.horizontalCenter }
                 Button {
                     text: "Start Event Challenge"
                     focusPolicy: Qt.NoFocus

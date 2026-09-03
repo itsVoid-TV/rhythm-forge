@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import subprocess
 import tempfile
 import unittest
@@ -32,10 +33,23 @@ class SecurityContractTests(unittest.TestCase):
         self.assertNotIn("notify-send", checker)
         self.assertNotIn("sudo pacman", checker)
 
+    def test_gameplay_polish_keeps_bounded_one_key_mechanics(self):
+        game = (ROOT / "app" / "Game.qml").read_text(encoding="utf-8")
+        self.assertIn("function updateActiveHold(now, note)", game)
+        self.assertIn("Math.max(0, Math.min(16, Math.floor((cappedNow - holdLastTickAt) / 250)))", game)
+        self.assertIn("Math.min(16, Math.max(1, Number(note.taps || 1)))", game)
+        self.assertIn('property string equippedBackground: "backgroundDefault"', game)
+        self.assertIn("root.backgroundTheme", game)
+
     def test_yt_dlp_ignores_ambient_config(self):
         launcher = (ROOT / "app" / "rhythm_forge.py").read_text(encoding="utf-8")
         self.assertGreaterEqual(launcher.count('"--ignore-config"'), 2)
         self.assertGreaterEqual(launcher.count('"--socket-timeout", "15"'), 2)
+
+    def test_manifest_and_launcher_versions_match(self):
+        manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
+        launcher = (ROOT / "app" / "rhythm_forge.py").read_text(encoding="utf-8")
+        self.assertIn(f'VERSION = "{manifest["version"]}"', launcher)
 
     def test_dependency_checker_accepts_complete_runtime(self):
         with tempfile.TemporaryDirectory() as directory_name:

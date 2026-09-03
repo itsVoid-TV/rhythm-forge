@@ -37,7 +37,7 @@ from progression import COLOR_GROUPS, COLOR_PRICE, ProgressionStore, advancement
 
 APP_ID = "io.github.omarchy.rhythmforge"
 APP_NAME = "Rhythm Forge"
-VERSION = "1.0.12"
+VERSION = "1.0.13"
 MAX_DURATION_SECONDS = MAX_MEDIA_DURATION_SECONDS
 BEATMAP_VERSION = 6
 MAX_METADATA_BYTES = 64 * 1024
@@ -460,7 +460,7 @@ class RhythmForgeWindow(Gtk.ApplicationWindow):
         values = self.progression_store.read()
         stars = int(values["stars"])
         lifetime = int(values["lifetimeStars"])
-        title = "Color Shop" if mode == "shop" else "Color Inventory"
+        title = "Style Shop" if mode == "shop" else "Style Inventory"
         window = Gtk.Window(title=f"Rhythm Forge — {title}")
         window.set_transient_for(self)
         window.set_modal(True)
@@ -498,7 +498,7 @@ class RhythmForgeWindow(Gtk.ApplicationWindow):
             outer.append(overview)
         else:
             explanation = Gtk.Label(
-                label=f"Every regular color costs ★{COLOR_PRICE}. Event-exclusive colors can only be won before songs.",
+                label=f"Every regular color or theme costs ★{COLOR_PRICE}. Event-exclusive styles can only be won before songs.",
                 xalign=0,
             )
             explanation.add_css_class("subtitle")
@@ -514,8 +514,18 @@ class RhythmForgeWindow(Gtk.ApplicationWindow):
         scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroller.set_vexpand(True)
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        group_names = {"spam": "SPAM COLORS", "hold": "HOLD COLORS", "lane": "TIMING-LINE COLORS"}
-        equipped_keys = {"spam": "equippedSpam", "hold": "equippedHold", "lane": "equippedLane"}
+        group_names = {
+            "spam": "SPAM COLORS",
+            "hold": "HOLD COLORS",
+            "lane": "TIMING-LINE COLORS",
+            "background": "BACKGROUND THEMES",
+        }
+        equipped_keys = {
+            "spam": "equippedSpam",
+            "hold": "equippedHold",
+            "lane": "equippedLane",
+            "background": "equippedBackground",
+        }
 
         for category, colors in COLOR_GROUPS.items():
             section = Gtk.Label(label=group_names[category], xalign=0)
@@ -537,7 +547,8 @@ class RhythmForgeWindow(Gtk.ApplicationWindow):
                 details = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
                 details.set_hexpand(True)
                 name = Gtk.Label(label=color["name"], xalign=0)
-                kind_text = "Event Exclusive" if color["kind"] == "event" else ("Included" if color["kind"] == "default" else f"Shop Color  ·  ★{COLOR_PRICE}")
+                shop_kind = "Shop Theme" if category == "background" else "Shop Color"
+                kind_text = "Event Exclusive" if color["kind"] == "event" else ("Included" if color["kind"] == "default" else f"{shop_kind}  ·  ★{COLOR_PRICE}")
                 kind = Gtk.Label(label=f"{group_names[category][:-7].title()}  ·  {kind_text}", xalign=0)
                 kind.add_css_class("subtitle")
                 details.append(name)
@@ -573,7 +584,7 @@ class RhythmForgeWindow(Gtk.ApplicationWindow):
                 row.append(action)
                 content.append(row)
             if visible_count == 0:
-                empty = Gtk.Label(label="No colors unlocked in this category yet.", xalign=0)
+                empty = Gtk.Label(label="No styles unlocked in this category yet.", xalign=0)
                 empty.add_css_class("subtitle")
                 content.append(empty)
 

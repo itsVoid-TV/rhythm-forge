@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
-from progression import COLOR_PRICE, ProgressionStore, advancement_rank  # noqa: E402
+from progression import COLOR_GROUPS, COLOR_PRICE, ProgressionStore, advancement_rank  # noqa: E402
 
 
 class ProgressionStoreTests(unittest.TestCase):
@@ -36,10 +36,36 @@ class ProgressionStoreTests(unittest.TestCase):
             equipped, _message = store.equip("lane", "laneYellow")
             self.assertFalse(equipped)
 
+    def test_background_theme_purchase_is_backward_compatible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "timing.ini"
+            path.write_text("[progression]\nstars=30\n", encoding="utf-8")
+            store = ProgressionStore(path)
+
+            values = store.read()
+            self.assertEqual(values["equippedBackground"], "backgroundDefault")
+            self.assertTrue(store.is_owned(values, "background", "backgroundDefault"))
+
+            changed, _message = store.buy("background", "backgroundNebula")
+            self.assertTrue(changed)
+            equipped, _message = store.equip("background", "backgroundNebula")
+            self.assertTrue(equipped)
+            self.assertEqual(store.read()["equippedBackground"], "backgroundNebula")
+
     def test_advancement_ranks(self):
         self.assertEqual(advancement_rank(0), "ROOKIE")
         self.assertEqual(advancement_rank(30), "BEAT RIDER")
         self.assertEqual(advancement_rank(100), "RHYTHM LEGEND")
+
+    def test_every_style_category_has_a_default_and_multiple_unlocks(self):
+        self.assertEqual(set(COLOR_GROUPS), {"spam", "hold", "lane", "background"})
+        game_qml = (Path(__file__).resolve().parents[1] / "app" / "Game.qml").read_text(encoding="utf-8")
+        for styles in COLOR_GROUPS.values():
+            self.assertEqual(sum(style["kind"] == "default" for style in styles), 1)
+            self.assertGreaterEqual(sum(style["kind"] == "shop" for style in styles), 5)
+            self.assertGreaterEqual(sum(style["kind"] == "event" for style in styles), 1)
+            for style in styles:
+                self.assertIn(f'"{style["id"]}"', game_qml)
 
 
 if __name__ == "__main__":

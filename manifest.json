@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.itsvoid-tv.rhythm-forge",
   "name": "Rhythm Forge",
-  "version": "1.0.12",
+  "version": "1.0.13",
   "author": "Tom Baltes (@itsVoid-TV)",
   "description": "Turn a music-video link into a one-key rhythm game",
   "kinds": [
