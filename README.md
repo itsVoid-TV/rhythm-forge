@@ -14,7 +14,7 @@ The interface and all user-facing errors use American English.
 - `yt-dlp`, `ffmpeg`, and `ffprobe`
 - A Nerd Font in the Omarchy bar (provided by the standard Omarchy setup)
 
-The standard Omarchy installation provides the Qt playback stack. Rhythm Forge never requests root access and does not run downloaded media as code.
+The standard Omarchy installation provides the Qt playback stack. Rhythm Forge does not run downloaded media as code. Any missing packages are offered through Omarchy's normal package helper only after explicit user action.
 
 ## Test without installing
 
@@ -29,6 +29,8 @@ omarchy plugin add https://github.com/itsVoid-TV/rhythm-forge.git --enable
 ```
 
 Omarchy clones and validates the public plugin repository, installs it as `io.github.itsvoid-tv.rhythm-forge`, and enables it in the right bar section. For local development, `./install.sh` installs the current checkout and preserves an existing installation under `${XDG_STATE_HOME:-~/.local/state}/rhythm-forge/plugin-backups/`.
+
+The marketplace installation never installs system packages silently. The bar widget checks all runtime dependencies before GTK is imported and changes to a warning icon when anything is missing. Clicking the warning shows an actionable Omarchy notification; clicking that notification opens the standard floating terminal and runs `omarchy-pkg-add` for only the missing packages. The user can inspect and cancel that normal package-manager flow.
 
 Click the music-note icon in the Omarchy bar to start the game. The extension can also be opened through IPC:
 
@@ -72,13 +74,20 @@ Rhythm Forge sends the pasted URL only to `yt-dlp` and the source site needed to
 
 Only download videos when you have permission to do so and when the source site's terms allow it.
 
+## Runtime safety
+
+- Every `yt-dlp`, `ffprobe`, and analysis `ffmpeg` process runs in its own process group with an absolute deadline. Timeout, cancellation, output-limit, and parser failures terminate the complete group and reap its leader.
+- Metadata, logs, individual output lines, FFmpeg diagnostics, decoded PCM, and media duration all have explicit ceilings. The duration read from the downloaded file must be finite, positive, and no longer than 20 minutes even when remote metadata claimed otherwise.
+- Percussion PCM is reduced into feature frames while it streams. Voice PCM is streamed into a size-limited temporary file and analyzed in two bounded passes, so neither FFmpeg pipe is accumulated without a limit in memory.
+- Remote title, artist, and decoder-error text is normalized and length-limited before storage or command-line use. QML renders those values explicitly as `Text.PlainText`.
+
 ## Development
 
 ```bash
 ./build.sh
 ```
 
-This runs the unit tests, Python syntax checks, the native `omarchy plugin validate` command, and produces a versioned tarball plus SHA-256 checksum in `dist/`.
+This runs the unit tests, Python and shell syntax checks, the native `omarchy plugin validate` command, and produces a versioned tarball plus SHA-256 checksum in `dist/`.
 
 ## Uninstall
 

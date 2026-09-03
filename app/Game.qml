@@ -72,6 +72,15 @@ ApplicationWindow {
     readonly property color holdColor: colorCatalog[progressionSettings.equippedHold] || colorCatalog.holdDefault
     readonly property color laneColor: colorCatalog[progressionSettings.equippedLane] || colorCatalog.laneDefault
 
+    function safeExternalText(value, fallback, limit) {
+        var raw = value === undefined || value === null ? "" : String(value)
+        var text = raw
+            .replace(/[\u0000-\u001F\u007F-\u009F\u202A-\u202E\u2066-\u2069]/g, " ")
+            .replace(/\s+/g, " ")
+            .trim()
+        return (text || fallback).slice(0, limit)
+    }
+
     function loadSession() {
         // The launcher passes six values after `--`. Reading from the end is
         // stable across qml runner versions, which prepend different internal
@@ -83,15 +92,15 @@ ApplicationWindow {
         var base = startupArguments.length - 6
         try {
             root.notes = JSON.parse(startupArguments[base + 1])
-            root.trackTitle = startupArguments[base + 2] || "Untitled track"
-            root.trackArtist = startupArguments[base + 3] || "Unknown artist"
+            root.trackTitle = root.safeExternalText(startupArguments[base + 2], "Untitled track", 160)
+            root.trackArtist = root.safeExternalText(startupArguments[base + 3], "Unknown artist", 100)
             root.trackKey = startupArguments[base + 4] || "default"
             root.settingsUri = startupArguments[base + 5]
             player.source = startupArguments[base]
             console.log("Rhythm Forge opening", player.source, "with", root.notes.length, "note blocks")
             restoreOffset.restart()
         } catch (error) {
-            root.playbackError = "Invalid track data: " + error
+            root.playbackError = root.safeExternalText("Invalid track data: " + error, "Invalid track data.", 500)
         }
     }
 
@@ -462,11 +471,11 @@ ApplicationWindow {
             } else if (mediaStatus === MediaPlayer.EndOfMedia) {
                 root.completeGame()
             } else if (mediaStatus === MediaPlayer.InvalidMedia) {
-                root.playbackError = errorString || "Qt Multimedia could not decode this video."
+                root.playbackError = root.safeExternalText(errorString, "Qt Multimedia could not decode this video.", 500)
             }
         }
         onErrorOccurred: function(error, errorString) {
-            root.playbackError = errorString || "The video could not be played."
+            root.playbackError = root.safeExternalText(errorString, "The video could not be played.", 500)
         }
     }
 
@@ -663,6 +672,7 @@ ApplicationWindow {
         Label {
             anchors.horizontalCenter: parent.horizontalCenter
             text: root.trackTitle + "  —  " + root.trackArtist
+            textFormat: Text.PlainText
             color: "#e8eaf4"
             padding: 10
             background: Rectangle { color: "#cc05070d"; radius: 10 }
@@ -686,7 +696,7 @@ ApplicationWindow {
             spacing: 16
             width: Math.min(620, parent.width - 60)
             Label { text: "PLAYBACK ERROR"; color: "#ff8096"; font.pixelSize: 34; font.bold: true; anchors.horizontalCenter: parent.horizontalCenter }
-            Label { text: root.playbackError; color: "white"; wrapMode: Text.Wrap; width: parent.width; horizontalAlignment: Text.AlignHCenter }
+            Label { text: root.playbackError; textFormat: Text.PlainText; color: "white"; wrapMode: Text.Wrap; width: parent.width; horizontalAlignment: Text.AlignHCenter }
             Button { text: "Close"; focusPolicy: Qt.NoFocus; anchors.horizontalCenter: parent.horizontalCenter; onClicked: root.close() }
         }
     }

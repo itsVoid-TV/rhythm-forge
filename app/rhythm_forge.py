@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -18,15 +19,34 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
 
-from engine import HIT_WINDOW_MS, ScoreState, analyze_media_chart, judge_timing, nearest_playable_beat, validate_video_url
+from engine import (
+    HIT_WINDOW_MS,
+    MAX_MEDIA_DURATION_SECONDS,
+    ProcessCancelledError,
+    ScoreState,
+    analyze_media_chart,
+    judge_timing,
+    nearest_playable_beat,
+    run_bounded_process,
+    sanitize_external_text,
+    terminate_process_group,
+    validate_video_url,
+)
 from progression import COLOR_GROUPS, COLOR_PRICE, ProgressionStore, advancement_rank
 
 
 APP_ID = "io.github.omarchy.rhythmforge"
 APP_NAME = "Rhythm Forge"
-VERSION = "1.0.11"
-MAX_DURATION_SECONDS = 20 * 60
-BEATMAP_VERSION = 5
+VERSION = "1.0.12"
+MAX_DURATION_SECONDS = MAX_MEDIA_DURATION_SECONDS
+BEATMAP_VERSION = 6
+MAX_METADATA_BYTES = 64 * 1024
+MAX_DOWNLOAD_LOG_BYTES = 1024 * 1024
+MAX_DOWNLOAD_LINE_BYTES = 4096
+DOWNLOAD_TIMEOUT_SECONDS = 30 * 60
+MAX_TITLE_LENGTH = 160
+MAX_ARTIST_LENGTH = 100
+MAX_UI_ERROR_LENGTH = 500
 
 
 CSS = b"""
@@ -57,21 +77,6 @@ def cache_root() -> Path:
     return path
 
 
-def playback_dependency_error() -> str | None:
-    inspector = shutil.which("gst-inspect-1.0")
-    if not inspector:
-        return "GStreamer playback tools are missing. Install gst-plugins-good and gst-libav."
-    missing = []
-    for element, package in (("autoaudiosink", "gst-plugins-good"), ("avdec_av1", "gst-libav")):
-        result = subprocess.run([inspector, element], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        if result.returncode != 0:
-            missing.append(package)
-    if missing:
-        packages = " ".join(dict.fromkeys(missing))
-        return f"Media playback support is missing. Install it with: sudo pacman -S {packages}"
-    return None
-
-
 def read_history() -> list[dict]:
     try:
         data = json.loads((cache_root() / "history.json").read_text(encoding="utf-8"))
@@ -93,13 +98,51 @@ def safe_component(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-.")[:100] or "track"
 
 
+class BoundedLineTail:
+    """Decode a process stream without accepting unbounded individual lines."""
+
+    def __init__(self, on_line=None, tail_lines: int = 12) -> None:
+        self.on_line = on_line
+        self.tail_lines = tail_lines
+        self.pending = bytearray()
+        self.tail: list[str] = []
+
+    def feed(self, chunk: bytes, _total: int) -> None:
+        self.pending.extend(chunk)
+        while True:
+            newline = self.pending.find(b"\n")
+            if newline < 0:
+                if len(self.pending) > MAX_DOWNLOAD_LINE_BYTES:
+                    raise RuntimeError("yt-dlp produced an overlong output line.")
+                return
+            raw_line = bytes(self.pending[:newline])
+            del self.pending[:newline + 1]
+            self._record(raw_line)
+
+    def finish(self) -> None:
+        if self.pending:
+            self._record(bytes(self.pending))
+            self.pending.clear()
+
+    def _record(self, raw_line: bytes) -> None:
+        if len(raw_line) > MAX_DOWNLOAD_LINE_BYTES:
+            raise RuntimeError("yt-dlp produced an overlong output line.")
+        line = raw_line.decode("utf-8", "replace").strip()
+        if line:
+            self.tail.append(line)
+            del self.tail[:-self.tail_lines]
+            if self.on_line:
+                self.on_line(line)
+
+
 class TrackLoader:
-    def __init__(self, url: str, status, progress, complete, failed) -> None:
+    def __init__(self, url: str, status, progress, complete, failed, cancel_event: threading.Event) -> None:
         self.url = url
         self.status = status
         self.progress = progress
         self.complete = complete
         self.failed = failed
+        self.cancel_event = cancel_event
 
     def emit(self, callback, *args) -> None:
         GLib.idle_add(callback, *args)
@@ -108,20 +151,32 @@ class TrackLoader:
         try:
             yt_dlp = shutil.which("yt-dlp")
             if not yt_dlp:
-                raise RuntimeError("yt-dlp is required. Install it with: sudo pacman -S yt-dlp")
+                raise RuntimeError("yt-dlp is unavailable. Reopen Rhythm Forge from the bar to check dependencies.")
 
             self.emit(self.status, "Reading video information…")
-            metadata_result = subprocess.run(
-                [yt_dlp, "--no-playlist", "--dump-single-json", "--no-warnings", self.url],
-                capture_output=True,
-                text=True,
-                check=False,
+            metadata_code, metadata_stdout, metadata_stderr = run_bounded_process(
+                [
+                    yt_dlp,
+                    "--ignore-config",
+                    "--no-playlist",
+                    "--socket-timeout", "15",
+                    "--retries", "3",
+                    "--no-warnings",
+                    "--print", "%(.{id,extractor_key,title,artist,uploader,duration})j",
+                    "--",
+                    self.url,
+                ],
+                timeout=45,
+                stdout_limit=MAX_METADATA_BYTES,
+                cancel_event=self.cancel_event,
             )
-            if metadata_result.returncode != 0:
-                raise RuntimeError(self.clean_error(metadata_result.stderr, "The video link could not be opened."))
-            metadata = json.loads(metadata_result.stdout)
+            if metadata_code != 0:
+                raise RuntimeError(self.clean_error(metadata_stderr.decode("utf-8", "replace"), "The video link could not be opened."))
+            metadata = json.loads(metadata_stdout.decode("utf-8", "strict"))
+            if not isinstance(metadata, dict):
+                raise RuntimeError("The video service returned invalid metadata.")
             duration = float(metadata.get("duration") or 0)
-            if duration <= 0:
+            if not math.isfinite(duration) or duration <= 0:
                 raise RuntimeError("This video does not report a playable duration.")
             if duration > MAX_DURATION_SECONDS:
                 raise RuntimeError("Choose a video shorter than 20 minutes.")
@@ -136,25 +191,44 @@ class TrackLoader:
                 output_template = str(track_dir / "track.%(ext)s")
                 command = [
                     yt_dlp,
+                    "--ignore-config",
                     "--no-playlist",
                     "--newline",
                     "--no-warnings",
+                    "--socket-timeout", "15",
+                    "--retries", "3",
+                    "--fragment-retries", "3",
+                    "--retry-sleep", "1",
                     "--max-filesize", "750M",
                     "-f", "bv*[vcodec^=avc1][height<=720]+ba[ext=m4a]/b[ext=mp4][height<=720]/bv*[height<=720]+ba/b[height<=720]/b",
                     "--merge-output-format", "mp4",
                     "-o", output_template,
+                    "--",
                     self.url,
                 ]
-                process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-                output_tail: list[str] = []
-                assert process.stdout is not None
-                for line in process.stdout:
-                    output_tail.append(line.strip())
-                    output_tail = output_tail[-12:]
+
+                def update_download_progress(line: str) -> None:
                     match = re.search(r"\[download\]\s+([0-9.]+)%", line)
                     if match:
                         self.emit(self.progress, min(0.72, float(match.group(1)) / 100.0 * 0.72))
-                if process.wait() != 0:
+
+                stdout_lines = BoundedLineTail(update_download_progress)
+                stderr_lines = BoundedLineTail()
+                download_code, _output, _download_stderr = run_bounded_process(
+                    command,
+                    timeout=DOWNLOAD_TIMEOUT_SECONDS,
+                    stdout_limit=MAX_DOWNLOAD_LOG_BYTES,
+                    stderr_limit=MAX_DOWNLOAD_LOG_BYTES,
+                    on_stdout=stdout_lines.feed,
+                    on_stderr=stderr_lines.feed,
+                    capture_stdout=False,
+                    capture_stderr=False,
+                    cancel_event=self.cancel_event,
+                )
+                stdout_lines.finish()
+                stderr_lines.finish()
+                if download_code != 0:
+                    output_tail = stdout_lines.tail + stderr_lines.tail
                     raise RuntimeError(self.clean_error("\n".join(output_tail), "The video download failed."))
                 media = self.find_media(track_dir)
                 if media is None:
@@ -170,14 +244,25 @@ class TrackLoader:
                 self.emit(self.progress, 1.0)
             else:
                 self.emit(self.status, "Separating percussion, vocal syllables, and held notes…")
-                beats, notes = analyze_media_chart(media, lambda value: self.emit(self.progress, 0.72 + value * 0.28))
+                beats, notes = analyze_media_chart(
+                    media,
+                    lambda value: self.emit(self.progress, 0.72 + value * 0.28),
+                    self.cancel_event,
+                )
                 self.write_beatmap(beatmap_path, media, beats, notes)
 
-            title = str(metadata.get("title") or "Untitled track")
-            artist = str(metadata.get("artist") or metadata.get("uploader") or "Unknown artist")
+            title = sanitize_external_text(metadata.get("title"), "Untitled track", MAX_TITLE_LENGTH)
+            artist = sanitize_external_text(
+                metadata.get("artist") or metadata.get("uploader"),
+                "Unknown artist",
+                MAX_ARTIST_LENGTH,
+            )
             self.emit(self.complete, media, beats, notes, title, artist, duration)
+        except ProcessCancelledError:
+            self.emit(self.failed, "Loading was cancelled.")
         except Exception as error:  # Worker errors must become UI messages.
-            self.emit(self.failed, str(error) or error.__class__.__name__)
+            message = sanitize_external_text(str(error), error.__class__.__name__, MAX_UI_ERROR_LENGTH)
+            self.emit(self.failed, message)
 
     @staticmethod
     def find_media(track_dir: Path) -> Path | None:
@@ -246,6 +331,7 @@ class RhythmForgeWindow(Gtk.ApplicationWindow):
         self.history_recorded = False
         self.media_generation = 0
         self.game_process: subprocess.Popen | None = None
+        self.loader_cancel_event = threading.Event()
         self.progression_store = ProgressionStore(cache_root() / "timing.ini")
         self.color_status_message = ""
 
@@ -537,8 +623,8 @@ class RhythmForgeWindow(Gtk.ApplicationWindow):
         valid_entries = [entry for entry in read_history() if Path(str(entry.get("media_path", ""))).is_file()]
         self.recent_card.set_visible(bool(valid_entries))
         for entry in valid_entries[:5]:
-            title = str(entry.get("title") or "Untitled track")
-            artist = str(entry.get("artist") or "Unknown artist")
+            title = sanitize_external_text(entry.get("title"), "Untitled track", MAX_TITLE_LENGTH)
+            artist = sanitize_external_text(entry.get("artist"), "Unknown artist", MAX_ARTIST_LENGTH)
             button = Gtk.Button(label=f"▶  {title}\n    {artist}")
             button.add_css_class("secondary-button")
             button.set_halign(Gtk.Align.FILL)
@@ -564,8 +650,8 @@ class RhythmForgeWindow(Gtk.ApplicationWindow):
             media_path,
             beats,
             notes,
-            str(entry.get("title") or "Untitled track"),
-            str(entry.get("artist") or "Unknown artist"),
+            sanitize_external_text(entry.get("title"), "Untitled track", MAX_TITLE_LENGTH),
+            sanitize_external_text(entry.get("artist"), "Unknown artist", MAX_ARTIST_LENGTH),
             float(entry.get("duration") or 0),
         )
         self.start_game()
@@ -579,14 +665,25 @@ class RhythmForgeWindow(Gtk.ApplicationWindow):
         self.progress.set_visible(True)
         self.status_label.remove_css_class("error")
         self.status_label.set_text("Updating this track with vocal-aware lyric detection…")
+        self.loader_cancel_event = threading.Event()
+        cancel_event = self.loader_cancel_event
 
         def worker() -> None:
             try:
-                beats, notes = analyze_media_chart(media_path, lambda value: GLib.idle_add(self.set_load_progress, value))
+                beats, notes = analyze_media_chart(
+                    media_path,
+                    lambda value: GLib.idle_add(self.set_load_progress, value),
+                    cancel_event,
+                )
                 TrackLoader.write_beatmap(media_path.parent / "beatmap.json", media_path, beats, notes)
                 GLib.idle_add(self.recent_reanalysis_ready, entry, media_path, beats, notes)
+            except ProcessCancelledError:
+                GLib.idle_add(self.show_load_error, "Loading was cancelled.")
             except Exception as error:
-                GLib.idle_add(self.show_load_error, str(error) or error.__class__.__name__)
+                GLib.idle_add(
+                    self.show_load_error,
+                    sanitize_external_text(str(error), error.__class__.__name__, MAX_UI_ERROR_LENGTH),
+                )
 
         threading.Thread(target=worker, name="beatmap-upgrade", daemon=True).start()
 
@@ -728,7 +825,15 @@ class RhythmForgeWindow(Gtk.ApplicationWindow):
         self.progress.set_visible(True)
         self.status_label.remove_css_class("error")
         self.status_label.set_text("Connecting…")
-        worker = TrackLoader(url, self.set_load_status, self.set_load_progress, self.track_ready, self.show_load_error)
+        self.loader_cancel_event = threading.Event()
+        worker = TrackLoader(
+            url,
+            self.set_load_status,
+            self.set_load_progress,
+            self.track_ready,
+            self.show_load_error,
+            self.loader_cancel_event,
+        )
         threading.Thread(target=worker.run, name="track-loader", daemon=True).start()
 
     def set_load_status(self, text: str) -> bool:
@@ -745,7 +850,7 @@ class RhythmForgeWindow(Gtk.ApplicationWindow):
         self.url_entry.set_sensitive(True)
         self.progress.set_visible(False)
         self.status_label.add_css_class("error")
-        self.status_label.set_text(message)
+        self.status_label.set_text(sanitize_external_text(message, "The operation failed.", MAX_UI_ERROR_LENGTH))
         return GLib.SOURCE_REMOVE
 
     def track_ready(
@@ -766,11 +871,11 @@ class RhythmForgeWindow(Gtk.ApplicationWindow):
         self.media_path = Path(media_path)
         self.beats = beats
         self.notes = notes
-        self.title_text = title
-        self.artist_text = artist
+        self.title_text = sanitize_external_text(title, "Untitled track", MAX_TITLE_LENGTH)
+        self.artist_text = sanitize_external_text(artist, "Unknown artist", MAX_ARTIST_LENGTH)
         self.current_duration = duration
-        self.track_label.set_text(f"{title}  ·  {artist}")
-        self.track_game_label.set_text(f"{title}  —  {artist}")
+        self.track_label.set_text(f"{self.title_text}  ·  {self.artist_text}")
+        self.track_game_label.set_text(f"{self.title_text}  —  {self.artist_text}")
         self.ready_box.set_visible(True)
         return GLib.SOURCE_REMOVE
 
@@ -812,9 +917,11 @@ class RhythmForgeWindow(Gtk.ApplicationWindow):
                         safe_component(self.media_path.parent.name),
                         timing_path.resolve().as_uri(),
                     ],
+                    stdin=subprocess.DEVNULL,
                     stdout=log_stream,
                     stderr=subprocess.STDOUT,
                     env=environment,
+                    start_new_session=True,
                 )
         except OSError as error:
             self.show_load_error(f"The game window could not start: {error}")
@@ -1065,8 +1172,10 @@ class RhythmForgeWindow(Gtk.ApplicationWindow):
         context.show_text(text)
 
     def on_close_request(self, _window) -> bool:
-        if self.game_process is not None and self.game_process.poll() is None:
-            self.game_process.terminate()
+        self.loader_cancel_event.set()
+        if self.game_process is not None:
+            terminate_process_group(self.game_process)
+            self.game_process = None
         if self.media:
             self.media.pause()
         return False

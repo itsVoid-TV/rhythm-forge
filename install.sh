@@ -8,22 +8,14 @@ target="$plugins_dir/$plugin_id"
 legacy_target="$plugins_dir/local.rhythm-forge"
 backup_dir="${XDG_STATE_HOME:-$HOME/.local/state}/rhythm-forge/plugin-backups"
 
-for command_name in omarchy jq python3 yt-dlp ffmpeg ffprobe; do
+for command_name in omarchy jq; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     echo "Missing required command: $command_name" >&2
     exit 1
   fi
 done
 
-python3 - <<'PY'
-import gi
-gi.require_version("Gtk", "4.0")
-from gi.repository import Gtk
-assert Gtk.get_major_version() == 4
-PY
-
-if [[ ! -x /usr/lib/qt6/bin/qml ]]; then
-  echo "Missing Qt QML runtime. Install it with: sudo pacman -S qt6-declarative" >&2
+if ! "$rhythm_forge_source/app/check-dependencies"; then
   exit 1
 fi
 

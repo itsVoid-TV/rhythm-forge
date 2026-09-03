@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
+import io
 import math
+import os
 from pathlib import Path
+import selectors
+import signal
 import shutil
 import statistics
 import struct
 import subprocess
-from typing import Callable, Iterable
+import tempfile
+import threading
+import time
+from typing import BinaryIO, Callable, Iterable
 from urllib.parse import urlparse
 
 
@@ -24,6 +32,10 @@ HOLD_MAX_SECONDS = 4.0
 VOICE_SAMPLE_RATE = 4_000
 VOICE_FRAME_SAMPLES = 320
 VOICE_HOP_SAMPLES = 80
+MAX_MEDIA_DURATION_SECONDS = 20 * 60
+MAX_ERROR_BYTES = 64 * 1024
+PROCESS_READ_CHUNK_BYTES = 64 * 1024
+PROCESS_TERMINATE_GRACE_SECONDS = 0.75
 
 
 def validate_video_url(value: str) -> str:
@@ -35,6 +47,25 @@ def validate_video_url(value: str) -> str:
     if parsed.username or parsed.password:
         raise ValueError("Links containing a username or password are not supported.")
     return value
+
+
+def sanitize_external_text(value: object, fallback: str, limit: int) -> str:
+    """Return bounded, single-line plain text suitable for UI and argv use."""
+    if limit < 1:
+        raise ValueError("Text limit must be positive.")
+    raw = str(value) if value is not None else ""
+    # Strip control characters, including bidi overrides/isolates that can make
+    # untrusted metadata visually impersonate neighboring UI text.
+    cleaned = "".join(
+        " " if ord(character) < 32
+        or 127 <= ord(character) <= 159
+        or 0x202A <= ord(character) <= 0x202E
+        or 0x2066 <= ord(character) <= 0x2069
+        else character
+        for character in raw
+    )
+    normalized = " ".join(cleaned.split())
+    return (normalized or fallback)[:limit]
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -117,17 +148,94 @@ def detect_beats_from_features(
     return [round(time_s, 4) for time_s, _strength in selected if time_s >= 0.35]
 
 
+class PCMFeatureAccumulator:
+    """Incrementally reduce PCM into fixed-size feature frames."""
+
+    def __init__(self, hop_samples: int = HOP_SAMPLES) -> None:
+        if hop_samples < 2:
+            raise ValueError("PCM feature frames require at least two samples.")
+        self.hop_samples = hop_samples
+        self.frame_bytes = hop_samples * 2
+        self.pending = bytearray()
+        self.energy: list[float] = []
+        self.brightness: list[float] = []
+
+    def feed(self, chunk: bytes, _total: int | None = None) -> None:
+        data = bytes(self.pending) + chunk
+        complete_bytes = len(data) - (len(data) % self.frame_bytes)
+        for offset in range(0, complete_bytes, self.frame_bytes):
+            frame = struct.unpack_from(f"<{self.hop_samples}h", data, offset)
+            square_sum = sum(sample * sample for sample in frame)
+            self.energy.append(math.sqrt(square_sum / self.hop_samples))
+            self.brightness.append(
+                sum(abs(frame[index] - frame[index - 1]) for index in range(1, len(frame)))
+                / (len(frame) - 1)
+            )
+        self.pending[:] = data[complete_bytes:]
+
+    def result(self) -> tuple[list[float], list[float]]:
+        return self.energy, self.brightness
+
+
 def pcm_features(pcm: bytes, hop_samples: int = HOP_SAMPLES) -> tuple[list[float], list[float]]:
-    usable = len(pcm) - (len(pcm) % 2)
-    samples = struct.unpack(f"<{usable // 2}h", pcm[:usable]) if usable else ()
-    energy: list[float] = []
-    brightness: list[float] = []
-    for start in range(0, len(samples) - hop_samples + 1, hop_samples):
-        frame = samples[start:start + hop_samples]
-        square_sum = sum(sample * sample for sample in frame)
-        energy.append(math.sqrt(square_sum / hop_samples))
-        brightness.append(sum(abs(frame[i] - frame[i - 1]) for i in range(1, len(frame))) / (len(frame) - 1))
-    return energy, brightness
+    accumulator = PCMFeatureAccumulator(hop_samples)
+    accumulator.feed(pcm)
+    return accumulator.result()
+
+
+def _iter_pcm_frames(
+    stream: BinaryIO,
+    frame_samples: int,
+    hop_samples: int,
+) -> Iterable[tuple[int, tuple[int, ...]]]:
+    """Yield overlapping PCM frames while retaining at most one frame in RAM."""
+    if hop_samples < 1 or frame_samples < hop_samples:
+        raise ValueError("PCM frame and hop sizes are invalid.")
+    frame_bytes = frame_samples * 2
+    hop_bytes = hop_samples * 2
+    stream.seek(0)
+    window = stream.read(frame_bytes)
+    start = 0
+    while len(window) == frame_bytes:
+        yield start, struct.unpack(f"<{frame_samples}h", window)
+        incoming = stream.read(hop_bytes)
+        if len(incoming) != hop_bytes:
+            break
+        window = window[hop_bytes:] + incoming
+        start += hop_samples
+
+
+def _frame_rms(raw: tuple[int, ...]) -> float:
+    mean = statistics.fmean(raw)
+    variance = max(0.0, statistics.fmean(sample * sample for sample in raw) - mean * mean)
+    return math.sqrt(variance)
+
+
+def _pitch_confidence(
+    raw: tuple[int, ...],
+    sample_rate: int,
+    minimum_lag: int,
+    maximum_lag: int,
+) -> tuple[float, float]:
+    mean = statistics.fmean(raw)
+    centered = [sample - mean for sample in raw]
+    square_prefix = [0.0]
+    for sample in centered:
+        square_prefix.append(square_prefix[-1] + sample * sample)
+
+    best_lag = 0
+    best_confidence = 0.0
+    for lag in range(minimum_lag, maximum_lag + 1):
+        count = len(centered) - lag
+        numerator = sum(centered[index] * centered[index + lag] for index in range(count))
+        left = square_prefix[count]
+        right = square_prefix[len(centered)] - square_prefix[lag]
+        denominator = math.sqrt(left * right)
+        confidence = numerator / denominator if denominator > 1.0 else 0.0
+        if confidence > best_confidence:
+            best_confidence = confidence
+            best_lag = lag
+    return best_confidence, sample_rate / best_lag if best_lag else 0.0
 
 
 def detect_voiced_segments(
@@ -144,92 +252,89 @@ def detect_voiced_segments(
     enough to run beside the percussion analysis.
     """
     usable = len(pcm) - (len(pcm) % 2)
-    samples = struct.unpack(f"<{usable // 2}h", pcm[:usable]) if usable else ()
-    if len(samples) < frame_samples:
+    return detect_voiced_segments_stream(
+        io.BytesIO(pcm[:usable]),
+        sample_rate=sample_rate,
+        frame_samples=frame_samples,
+        hop_samples=hop_samples,
+    )
+
+
+def detect_voiced_segments_stream(
+    stream: BinaryIO,
+    sample_rate: int = VOICE_SAMPLE_RATE,
+    frame_samples: int = VOICE_FRAME_SAMPLES,
+    hop_samples: int = VOICE_HOP_SAMPLES,
+) -> list[dict[str, float]]:
+    """Analyze seekable PCM with two bounded passes and constant phrase state."""
+    rms_values = [_frame_rms(raw) for _start, raw in _iter_pcm_frames(stream, frame_samples, hop_samples)]
+    if not rms_values:
         return []
 
-    frames: list[tuple[int, float, float, float]] = []
     minimum_lag = max(2, round(sample_rate / 500.0))
     maximum_lag = min(frame_samples // 2, round(sample_rate / 90.0))
-    rms_values: list[float] = []
-    prepared: list[tuple[int, list[float], float]] = []
-    for start in range(0, len(samples) - frame_samples + 1, hop_samples):
-        raw = samples[start:start + frame_samples]
-        mean = statistics.fmean(raw)
-        centered = [sample - mean for sample in raw]
-        energy_sum = sum(sample * sample for sample in centered)
-        rms = math.sqrt(energy_sum / frame_samples)
-        rms_values.append(rms)
-        prepared.append((start, centered, energy_sum))
-
     energy_threshold = max(90.0, percentile(rms_values, 0.30) * 1.22)
-    for (start, centered, energy_sum), rms in zip(prepared, rms_values):
-        if rms < energy_threshold or energy_sum <= 1.0:
-            frames.append((start, rms, 0.0, 0.0))
-            continue
-        best_lag = 0
-        best_confidence = 0.0
-        square_prefix = [0.0]
-        for sample in centered:
-            square_prefix.append(square_prefix[-1] + sample * sample)
-        for lag in range(minimum_lag, maximum_lag + 1):
-            count = frame_samples - lag
-            numerator = sum(centered[index] * centered[index + lag] for index in range(count))
-            left = square_prefix[count]
-            right = square_prefix[frame_samples] - square_prefix[lag]
-            denominator = math.sqrt(left * right)
-            confidence = numerator / denominator if denominator > 1.0 else 0.0
-            if confidence > best_confidence:
-                best_confidence = confidence
-                best_lag = lag
-        pitch = sample_rate / best_lag if best_lag else 0.0
-        frames.append((start, rms, best_confidence, pitch))
-
     segments: list[dict[str, float]] = []
-    current: list[tuple[int, float, float, float]] = []
+    current_start: int | None = None
+    last_voiced_start = 0
+    confidence_total = 0.0
+    confidence_count = 0
+    recent_pitches: deque[float] = deque(maxlen=10)
     dropout = 0
     allowed_dropout = max(1, round(0.12 * sample_rate / hop_samples))
 
     def finish_current() -> None:
-        nonlocal current, dropout
-        voiced = [frame for frame in current if frame[2] >= 0.54]
-        if voiced:
-            start_s = voiced[0][0] / sample_rate
-            end_s = (voiced[-1][0] + frame_samples) / sample_rate
+        nonlocal current_start, last_voiced_start, confidence_total, confidence_count, dropout
+        if current_start is not None and confidence_count:
+            start_s = current_start / sample_rate
+            end_s = (last_voiced_start + frame_samples) / sample_rate
             segments.append({
                 "start": round(start_s, 4),
                 "end": round(end_s, 4),
-                "confidence": round(statistics.fmean(frame[2] for frame in voiced), 4),
-                "pitch": round(statistics.median(frame[3] for frame in voiced), 2),
+                "confidence": round(confidence_total / confidence_count, 4),
+                "pitch": round(statistics.median(recent_pitches), 2),
             })
-        current = []
+        current_start = None
+        confidence_total = 0.0
+        confidence_count = 0
+        recent_pitches.clear()
         dropout = 0
 
-    for frame in frames:
-        voiced = frame[2] >= 0.54 and 90.0 <= frame[3] <= 500.0
+    def accept_frame(start: int, confidence: float, pitch: float) -> None:
+        nonlocal current_start, last_voiced_start, confidence_total, confidence_count, dropout
+        if current_start is None:
+            current_start = start
+        last_voiced_start = start
+        confidence_total += confidence
+        confidence_count += 1
+        recent_pitches.append(pitch)
+        dropout = 0
+
+    for start, raw in _iter_pcm_frames(stream, frame_samples, hop_samples):
+        rms = _frame_rms(raw)
+        confidence, pitch = (0.0, 0.0)
+        if rms >= energy_threshold:
+            confidence, pitch = _pitch_confidence(raw, sample_rate, minimum_lag, maximum_lag)
+        voiced = confidence >= 0.54 and 90.0 <= pitch <= 500.0
         pitch_fits = True
-        if voiced and current:
-            recent_pitches = [item[3] for item in current[-10:] if item[2] >= 0.54]
+        if voiced and current_start is not None:
             if recent_pitches:
                 reference = statistics.median(recent_pitches)
-                raw_cents = 1200.0 * math.log2(frame[3] / reference)
+                raw_cents = 1200.0 * math.log2(pitch / reference)
                 # Mixed vocals often make autocorrelation alternate between a
                 # fundamental and its octave. Treat octave-equivalent estimates
                 # as one sustained note instead of fragmenting the vowel.
                 octave_cents = abs(raw_cents - round(raw_cents / 1200.0) * 1200.0)
                 pitch_fits = octave_cents <= 320.0
         if voiced and pitch_fits:
-            current.append(frame)
-            dropout = 0
-        elif current:
+            accept_frame(start, confidence, pitch)
+        elif current_start is not None:
             dropout += 1
-            if dropout <= allowed_dropout:
-                current.append((frame[0], frame[1], 0.0, 0.0))
-            else:
+            if dropout > allowed_dropout:
                 finish_current()
                 if voiced:
-                    current.append(frame)
-    if current:
+                    accept_frame(start, confidence, pitch)
+    if current_start is not None:
         finish_current()
 
     minimum_phrase = 0.14
@@ -350,80 +455,238 @@ def build_note_chart(
     return chart
 
 
+class ProcessCancelledError(RuntimeError):
+    """Raised after an explicitly cancelled child process has been reaped."""
+
+
+def _process_group_exists(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def terminate_process_group(process: subprocess.Popen) -> None:
+    """Terminate a child process group and synchronously reap its leader."""
+    process_group = process.pid  # start_new_session=True makes pid == pgid.
+    try:
+        os.killpg(process_group, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+    grace_deadline = time.monotonic() + PROCESS_TERMINATE_GRACE_SECONDS
+    while _process_group_exists(process_group) and time.monotonic() < grace_deadline:
+        if process.poll() is None:
+            try:
+                process.wait(timeout=0.05)
+            except subprocess.TimeoutExpired:
+                pass
+        else:
+            time.sleep(0.02)
+
+    if _process_group_exists(process_group):
+        try:
+            os.killpg(process_group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if process.poll() is None:
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+    else:
+        process.wait()
+
+
+def run_bounded_process(
+    command: list[str], *, timeout: float, stdout_limit: int,
+    stderr_limit: int = MAX_ERROR_BYTES,
+    on_stdout: Callable[[bytes, int], None] | None = None,
+    on_stderr: Callable[[bytes, int], None] | None = None,
+    capture_stdout: bool = True,
+    capture_stderr: bool = True,
+    cancel_event: threading.Event | None = None,
+    env: dict[str, str] | None = None,
+) -> tuple[int, bytes, bytes]:
+    """Run a process with bounded pipes, a deadline, and group cancellation."""
+    if timeout <= 0 or stdout_limit < 0 or stderr_limit < 0:
+        raise ValueError("Process timeout and output limits must be non-negative.")
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+        env=env,
+    )
+    selector = selectors.DefaultSelector()
+    stdout = bytearray()
+    stderr = bytearray()
+    totals = {"stdout": 0, "stderr": 0}
+    deadline = time.monotonic() + timeout
+    assert process.stdout is not None and process.stderr is not None
+    for stream, label in ((process.stdout, "stdout"), (process.stderr, "stderr")):
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ, label)
+    try:
+        while selector.get_map():
+            if cancel_event is not None and cancel_event.is_set():
+                raise ProcessCancelledError("Media processing was cancelled.")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Media tool exceeded its {int(timeout)} second deadline.")
+            for key, _ in selector.select(min(0.25, remaining)):
+                try:
+                    chunk = os.read(key.fileobj.fileno(), PROCESS_READ_CHUNK_BYTES)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                    continue
+                limit = stdout_limit if key.data == "stdout" else stderr_limit
+                totals[key.data] += len(chunk)
+                if totals[key.data] > limit:
+                    raise RuntimeError(f"Media tool {key.data} exceeded the {limit}-byte safety limit.")
+                if key.data == "stdout":
+                    if capture_stdout:
+                        stdout.extend(chunk)
+                    if on_stdout:
+                        on_stdout(chunk, totals["stdout"])
+                else:
+                    if capture_stderr:
+                        stderr.extend(chunk)
+                    if on_stderr:
+                        on_stderr(chunk, totals["stderr"])
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Media tool exceeded its {int(timeout)} second deadline.")
+        try:
+            return process.wait(timeout=remaining), bytes(stdout), bytes(stderr)
+        except subprocess.TimeoutExpired as error:
+            raise TimeoutError(f"Media tool exceeded its {int(timeout)} second deadline.") from error
+    except BaseException:
+        terminate_process_group(process)
+        raise
+    finally:
+        selector.close()
+        if process.poll() is None:
+            terminate_process_group(process)
+        for stream in (process.stdout, process.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
+
+
 def analyze_media_chart(
     path: Path,
     on_progress: Callable[[float], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[list[float], list[dict[str, float | int | str]]]:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise RuntimeError("ffmpeg is required to analyze the track.")
 
-    duration = probe_duration(path)
+    duration = probe_duration(path, cancel_event=cancel_event)
+    analysis_timeout = min(20 * 60, max(90.0, duration * 2.0))
     command = [
-        ffmpeg, "-v", "error", "-i", str(path), "-vn", "-ac", "1",
-        "-ar", str(SAMPLE_RATE), "-f", "s16le", "-",
+        ffmpeg, "-nostdin", "-hide_banner", "-v", "error", "-i", str(path),
+        "-t", f"{duration:.6f}", "-vn", "-ac", "1",
+        "-ar", str(SAMPLE_RATE), "-f", "s16le", "pipe:1",
     ]
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    chunks: list[bytes] = []
-    read_bytes = 0
     expected_bytes = max(1, int(duration * SAMPLE_RATE * 2))
-    assert process.stdout is not None
-    while True:
-        chunk = process.stdout.read(256 * 1024)
-        if not chunk:
-            break
-        chunks.append(chunk)
-        read_bytes += len(chunk)
-        if on_progress:
-            on_progress(min(0.72, read_bytes / expected_bytes * 0.72))
-    stderr = process.stderr.read().decode("utf-8", "replace") if process.stderr else ""
-    if process.wait() != 0:
-        raise RuntimeError(stderr.strip() or "ffmpeg could not decode this video.")
+    feature_accumulator = PCMFeatureAccumulator()
 
-    energy, brightness = pcm_features(b"".join(chunks))
+    def consume_percussion(chunk: bytes, count: int) -> None:
+        feature_accumulator.feed(chunk)
+        if on_progress:
+            on_progress(min(0.72, count / expected_bytes * 0.72))
+
+    returncode, _pcm, stderr_bytes = run_bounded_process(
+        command,
+        timeout=analysis_timeout,
+        stdout_limit=expected_bytes + SAMPLE_RATE * 2,
+        on_stdout=consume_percussion,
+        capture_stdout=False,
+        cancel_event=cancel_event,
+    )
+    stderr = stderr_bytes.decode("utf-8", "replace").strip()
+    if returncode != 0:
+        raise RuntimeError(stderr or "ffmpeg could not decode this video.")
+
+    energy, brightness = feature_accumulator.result()
     beats = detect_beats_from_features(energy, brightness)
     if len(beats) < 8:
         raise RuntimeError("Not enough clear beats were found. Try a track with stronger percussion.")
 
     voice_command = [
-        ffmpeg, "-v", "error", "-i", str(path), "-vn", "-ac", "1",
+        ffmpeg, "-nostdin", "-hide_banner", "-v", "error", "-i", str(path),
+        "-t", f"{duration:.6f}", "-vn", "-ac", "1",
         "-af", "highpass=f=90,lowpass=f=1800",
-        "-ar", str(VOICE_SAMPLE_RATE), "-f", "s16le", "-",
+        "-ar", str(VOICE_SAMPLE_RATE), "-f", "s16le", "pipe:1",
     ]
-    voice_result = subprocess.run(voice_command, capture_output=True, check=False)
-    if voice_result.returncode != 0:
-        message = voice_result.stderr.decode("utf-8", "replace").strip()
-        raise RuntimeError(message or "ffmpeg could not analyze the vocal range.")
-    if on_progress:
-        on_progress(0.90)
-    vocal_segments = detect_voiced_segments(voice_result.stdout)
+    voice_limit = max(1, int(duration * VOICE_SAMPLE_RATE * 2)) + VOICE_SAMPLE_RATE * 2
+    with tempfile.TemporaryFile() as voice_pcm:
+        def consume_voice(chunk: bytes, count: int) -> None:
+            voice_pcm.write(chunk)
+            if on_progress:
+                on_progress(0.72 + min(0.18, count / max(1, voice_limit) * 0.18))
+
+        voice_code, _voice_output, voice_stderr = run_bounded_process(
+            voice_command,
+            timeout=analysis_timeout,
+            stdout_limit=voice_limit,
+            on_stdout=consume_voice,
+            capture_stdout=False,
+            cancel_event=cancel_event,
+        )
+        if voice_code != 0:
+            message = voice_stderr.decode("utf-8", "replace").strip()
+            raise RuntimeError(message or "ffmpeg could not analyze the vocal range.")
+        if on_progress:
+            on_progress(0.90)
+        voice_pcm.flush()
+        vocal_segments = detect_voiced_segments_stream(voice_pcm)
     if on_progress:
         on_progress(1.0)
     return beats, build_note_chart(beats, energy, vocal_segments=vocal_segments)
 
 
-def analyze_media(path: Path, on_progress: Callable[[float], None] | None = None) -> list[float]:
+def analyze_media(
+    path: Path,
+    on_progress: Callable[[float], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> list[float]:
     """Compatibility helper returning only onset times."""
-    beats, _chart = analyze_media_chart(path, on_progress)
+    beats, _chart = analyze_media_chart(path, on_progress, cancel_event)
     return beats
 
 
-def probe_duration(path: Path) -> float:
+def probe_duration(path: Path, cancel_event: threading.Event | None = None) -> float:
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
         raise RuntimeError("ffprobe is required to read the track duration.")
-    result = subprocess.run(
-        [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)],
-        capture_output=True,
-        text=True,
-        check=False,
+    returncode, stdout, stderr = run_bounded_process(
+        [
+            ffprobe, "-hide_banner", "-v", "error",
+            "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path),
+        ],
+        timeout=20,
+        stdout_limit=1024,
+        cancel_event=cancel_event,
     )
+    error_text = stderr.decode("utf-8", "replace").strip()
+    if returncode != 0:
+        raise RuntimeError(error_text or "Could not read the video duration.")
     try:
-        duration = float(result.stdout.strip())
-    except ValueError as error:
-        raise RuntimeError(result.stderr.strip() or "Could not read the video duration.") from error
-    if duration <= 0:
+        duration = float(stdout.decode("ascii", "strict").strip())
+    except (ValueError, UnicodeDecodeError) as error:
+        raise RuntimeError(error_text or "Could not read the video duration.") from error
+    if not math.isfinite(duration) or duration <= 0:
         raise RuntimeError("The video has no playable duration.")
+    if duration > MAX_MEDIA_DURATION_SECONDS:
+        raise RuntimeError("Choose a video shorter than 20 minutes.")
     return duration
 
 

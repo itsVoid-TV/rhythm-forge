@@ -1,0 +1,58 @@
+#!/bin/bash
+set -u
+
+mode="${1:-}"
+if [[ -n "$mode" && "$mode" != "--notify" ]]; then
+  echo "Usage: check-dependencies [--notify]" >&2
+  exit 2
+fi
+
+packages=()
+
+add_package() {
+  local package
+  for package in "$@"; do
+    if [[ " ${packages[*]} " != *" $package "* ]]; then
+      packages+=("$package")
+    fi
+  done
+}
+
+if ! command -v python3 >/dev/null 2>&1; then
+  add_package python gtk4 python-gobject
+elif ! timeout 5s python3 -I -c \
+  'import gi; gi.require_version("Gtk", "4.0"); from gi.repository import Gtk; assert Gtk.get_major_version() == 4' \
+  >/dev/null 2>&1; then
+  add_package gtk4 python-gobject
+fi
+
+command -v yt-dlp >/dev/null 2>&1 || add_package yt-dlp
+if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+  add_package ffmpeg
+fi
+if ! command -v qml >/dev/null 2>&1 && [[ ! -x /usr/lib/qt6/bin/qml ]]; then
+  add_package qt6-declarative
+fi
+pacman -Qq qt6-multimedia >/dev/null 2>&1 || add_package qt6-multimedia
+pacman -Qq qt6-multimedia-ffmpeg >/dev/null 2>&1 || add_package qt6-multimedia-ffmpeg
+
+if ((${#packages[@]} == 0)); then
+  echo "Rhythm Forge is ready."
+  exit 0
+fi
+
+package_list="${packages[*]}"
+message="Missing packages: $package_list. Install with: omarchy-pkg-add $package_list"
+echo "$message"
+
+if [[ "$mode" == "--notify" ]]; then
+  omarchy-notification-send \
+    -u critical \
+    -g "" \
+    "Rhythm Forge needs dependencies" \
+    "Missing: $package_list. Click to install with Omarchy." \
+    --exec omarchy-launch-floating-terminal-with-presentation omarchy-pkg-add "${packages[@]}" \
+    >/dev/null 2>&1 || true
+fi
+
+exit 1

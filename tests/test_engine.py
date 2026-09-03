@@ -2,21 +2,78 @@ import math
 import struct
 import sys
 from pathlib import Path
+import threading
 import unittest
+from unittest.mock import patch
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
+import engine  # noqa: E402
 from engine import (  # noqa: E402
+    PCMFeatureAccumulator,
+    ProcessCancelledError,
     ScoreState,
     build_note_chart,
     detect_voiced_segments,
     detect_beats_from_features,
     judge_timing,
+    run_bounded_process,
     nearest_playable_beat,
     pcm_features,
+    probe_duration,
+    sanitize_external_text,
     validate_video_url,
 )
+
+
+class BoundedProcessTests(unittest.TestCase):
+    def test_captures_small_stdout_and_stderr(self):
+        code, stdout, stderr = run_bounded_process(
+            [sys.executable, "-c", "import sys; print('ok'); print('note', file=sys.stderr)"],
+            timeout=2, stdout_limit=64, stderr_limit=64,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout, b"ok\n")
+        self.assertEqual(stderr, b"note\n")
+
+    def test_rejects_output_above_ceiling(self):
+        with self.assertRaisesRegex(RuntimeError, "safety limit"):
+            run_bounded_process(
+                [sys.executable, "-c", "print('x' * 4096)"],
+                timeout=2, stdout_limit=32,
+            )
+
+    def test_terminates_process_at_deadline(self):
+        with self.assertRaisesRegex(TimeoutError, "deadline"):
+            run_bounded_process(
+                [sys.executable, "-c", "import time; time.sleep(5)"],
+                timeout=0.1, stdout_limit=32,
+            )
+
+    def test_streams_without_retaining_stdout(self):
+        chunks = []
+        code, stdout, _stderr = run_bounded_process(
+            [sys.executable, "-c", "print('streamed')"],
+            timeout=2,
+            stdout_limit=64,
+            on_stdout=lambda chunk, _total: chunks.append(chunk),
+            capture_stdout=False,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(b"".join(chunks), b"streamed\n")
+
+    def test_honors_explicit_cancellation(self):
+        cancelled = threading.Event()
+        cancelled.set()
+        with self.assertRaisesRegex(ProcessCancelledError, "cancelled"):
+            run_bounded_process(
+                [sys.executable, "-c", "import time; time.sleep(5)"],
+                timeout=2,
+                stdout_limit=32,
+                cancel_event=cancelled,
+            )
 
 
 class UrlValidationTests(unittest.TestCase):
@@ -31,6 +88,11 @@ class UrlValidationTests(unittest.TestCase):
     def test_rejects_credentials(self):
         with self.assertRaises(ValueError):
             validate_video_url("https://name:secret@example.com/video")
+
+    def test_sanitizes_and_bounds_external_text(self):
+        value = "  <b>Song</b>\n\u202eabc\x00  "
+        self.assertEqual(sanitize_external_text(value, "fallback", 12), "<b>Song</b> ")
+        self.assertEqual(sanitize_external_text("\x00\n", "fallback", 20), "fallback")
 
 
 class BeatDetectionTests(unittest.TestCase):
@@ -58,6 +120,15 @@ class BeatDetectionTests(unittest.TestCase):
         self.assertEqual(len(energy), 2)
         self.assertTrue(all(value > 0 for value in energy))
         self.assertTrue(all(value > 0 for value in brightness))
+
+    def test_streamed_pcm_features_match_one_shot_analysis(self):
+        samples = [int(10_000 * math.sin(index / 8)) for index in range(1536)]
+        pcm = struct.pack(f"<{len(samples)}h", *samples)
+        expected = pcm_features(pcm, hop_samples=256)
+        accumulator = PCMFeatureAccumulator(hop_samples=256)
+        for start in range(0, len(pcm), 173):
+            accumulator.feed(pcm[start:start + 173])
+        self.assertEqual(accumulator.result(), expected)
 
     def test_groups_spam_and_detects_sustained_hold(self):
         beats = [0.50, 0.75, 1.00, 1.25, 2.00, 3.40, 4.00]
@@ -106,6 +177,20 @@ class BeatDetectionTests(unittest.TestCase):
         holds = [note for note in chart if note["type"] == "hold"]
         self.assertEqual(holds, [{"type": "hold", "start": 0.95, "end": 2.2}])
         self.assertFalse(any(0.95 <= note["start"] <= 2.2 and note["type"] != "hold" for note in chart))
+
+
+class MediaBoundaryTests(unittest.TestCase):
+    @patch.object(engine.shutil, "which", return_value="/usr/bin/ffprobe")
+    @patch.object(engine, "run_bounded_process", return_value=(0, b"nan\n", b""))
+    def test_probe_rejects_non_finite_duration(self, _run, _which):
+        with self.assertRaisesRegex(RuntimeError, "playable duration"):
+            probe_duration(Path("track.mp4"))
+
+    @patch.object(engine.shutil, "which", return_value="/usr/bin/ffprobe")
+    @patch.object(engine, "run_bounded_process", return_value=(0, b"1200.1\n", b""))
+    def test_probe_rejects_media_over_twenty_minutes(self, _run, _which):
+        with self.assertRaisesRegex(RuntimeError, "shorter than 20 minutes"):
+            probe_duration(Path("track.mp4"))
 
 
 class ScoringTests(unittest.TestCase):

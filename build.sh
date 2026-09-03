@@ -10,6 +10,12 @@ mkdir -p "$dist_dir"
 python3 -m unittest discover -s "$rhythm_forge_root/tests" -v
 omarchy plugin validate "$rhythm_forge_root"
 python3 -m py_compile "$rhythm_forge_root/app/engine.py" "$rhythm_forge_root/app/progression.py" "$rhythm_forge_root/app/rhythm_forge.py"
+bash -n \
+  "$rhythm_forge_root/app/check-dependencies" \
+  "$rhythm_forge_root/app/rhythm-forge" \
+  "$rhythm_forge_root/install.sh" \
+  "$rhythm_forge_root/uninstall.sh" \
+  "$rhythm_forge_root/run.sh"
 
 tar \
   --exclude='./.git' \
