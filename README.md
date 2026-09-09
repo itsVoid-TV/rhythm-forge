@@ -14,6 +14,13 @@ The interface and all user-facing errors use American English.
 - `yt-dlp`, `ffmpeg`, and `ffprobe`
 - A Nerd Font in the Omarchy bar (provided by the standard Omarchy setup)
 
+Rhythm Forge needs the **Qt 6** QML runtime specifically. It looks for
+`/usr/lib/qt6/bin/qml`, then `qml6`, then a `qml` on `PATH` that reports a 6.x
+runtime — a system that also has `qt5-declarative` installed keeps the Qt 5
+runtime at `/usr/bin/qml`, where it would otherwise shadow Qt 6. Set
+`RHYTHM_FORGE_QT6_QML` to point at the runtime directly if Qt 6 lives in a
+different prefix.
+
 The standard Omarchy installation provides the Qt playback stack. Rhythm Forge does not run downloaded media as code. Any missing packages are offered through Omarchy's normal package helper only after explicit user action.
 
 ## Test without installing

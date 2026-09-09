@@ -69,6 +69,46 @@ progressbar progress { background: #8668ff; border-radius: 6px; min-height: 7px;
 """
 
 
+QT6_QML_BANNER = "Qml Runtime 6"
+
+
+def is_qt6_qml(binary: str) -> bool:
+    """Report whether a "qml" runtime binary belongs to Qt 6."""
+    try:
+        result = subprocess.run(
+            [binary, "-v"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return QT6_QML_BANNER in f"{result.stdout} {result.stderr}"
+
+
+def find_qt6_qml() -> str | None:
+    """Locate the Qt 6 QML runtime.
+
+    Game.qml is Qt 6 QML. A system that also has qt5-declarative installed
+    keeps the Qt 5 runtime at /usr/bin/qml, where it shadows Qt 6 on PATH and
+    fails with "Did not load any objects, exiting." Prefer the versioned Qt 6
+    path, then qml6, and accept a plain "qml" only when it reports Qt 6.
+    """
+    override = os.environ.get("RHYTHM_FORGE_QT6_QML")
+    candidates = (
+        override or "/usr/lib/qt6/bin/qml",
+        shutil.which("qml6"),
+        shutil.which("qml"),
+    )
+    for candidate in candidates:
+        if not candidate or not os.access(candidate, os.X_OK):
+            continue
+        if is_qt6_qml(candidate):
+            return candidate
+    return None
+
+
 def cache_root() -> Path:
     configured = os.environ.get("XDG_CACHE_HOME")
     base = Path(configured).expanduser() if configured else Path.home() / ".cache"
@@ -893,11 +933,9 @@ class RhythmForgeWindow(Gtk.ApplicationWindow):
     def start_game(self) -> None:
         if not self.media_path or not self.notes:
             return
-        qml = shutil.which("qml")
-        if qml is None and Path("/usr/lib/qt6/bin/qml").is_file():
-            qml = "/usr/lib/qt6/bin/qml"
+        qml = find_qt6_qml()
         if qml is None:
-            self.show_load_error("The Qt QML runtime is missing. Install qt6-declarative.")
+            self.show_load_error("The Qt 6 QML runtime is missing. Install qt6-declarative.")
             return
         qml_game = Path(__file__).with_name("Game.qml")
         if not qml_game.is_file():

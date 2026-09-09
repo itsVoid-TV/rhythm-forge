@@ -30,7 +30,23 @@ command -v yt-dlp >/dev/null 2>&1 || add_package yt-dlp
 if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
   add_package ffmpeg
 fi
-if ! command -v qml >/dev/null 2>&1 && [[ ! -x /usr/lib/qt6/bin/qml ]]; then
+# Game.qml is Qt 6 QML. A system that also has qt5-declarative installed keeps
+# the Qt 5 runtime at /usr/bin/qml, where it shadows Qt 6 on PATH, so a bare
+# "command -v qml" does not prove the requirement is met. Prefer the versioned
+# Qt 6 path, then qml6, and accept a plain "qml" only when it reports Qt 6.
+qt6_qml=""
+for candidate in \
+  "${RHYTHM_FORGE_QT6_QML:-/usr/lib/qt6/bin/qml}" \
+  "$(command -v qml6 2>/dev/null || true)" \
+  "$(command -v qml 2>/dev/null || true)"; do
+  [[ -n "$candidate" && -x "$candidate" ]] || continue
+  banner="$(timeout 10s "$candidate" -v 2>&1 || true)"
+  if [[ "$banner" == *"Qml Runtime 6"* ]]; then
+    qt6_qml="$candidate"
+    break
+  fi
+done
+if [[ -z "$qt6_qml" ]]; then
   add_package qt6-declarative
 fi
 pacman -Qq qt6-multimedia >/dev/null 2>&1 || add_package qt6-multimedia
