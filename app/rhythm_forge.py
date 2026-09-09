@@ -37,7 +37,7 @@ from progression import COLOR_GROUPS, COLOR_PRICE, ProgressionStore, advancement
 
 APP_ID = "io.github.omarchy.rhythmforge"
 APP_NAME = "Rhythm Forge"
-VERSION = "1.0.13"
+VERSION = "1.0.14"
 MAX_DURATION_SECONDS = MAX_MEDIA_DURATION_SECONDS
 BEATMAP_VERSION = 6
 MAX_METADATA_BYTES = 64 * 1024
