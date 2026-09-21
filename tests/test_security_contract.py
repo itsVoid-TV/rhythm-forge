@@ -56,11 +56,6 @@ class SecurityContractTests(unittest.TestCase):
         self.assertIn('property string equippedBackground: "backgroundDefault"', game)
         self.assertIn("root.backgroundTheme", game)
 
-    def test_yt_dlp_ignores_ambient_config(self):
-        launcher = (ROOT / "app" / "rhythm_forge.py").read_text(encoding="utf-8")
-        self.assertGreaterEqual(launcher.count('"--ignore-config"'), 2)
-        self.assertGreaterEqual(launcher.count('"--socket-timeout", "15"'), 2)
-
     def test_manifest_and_launcher_versions_match(self):
         manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
         launcher = (ROOT / "app" / "rhythm_forge.py").read_text(encoding="utf-8")

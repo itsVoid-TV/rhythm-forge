@@ -9,7 +9,7 @@ archive="$dist_dir/rhythm-forge-$version.tar.gz"
 mkdir -p "$dist_dir"
 python3 -m unittest discover -s "$rhythm_forge_root/tests" -v
 omarchy plugin validate "$rhythm_forge_root"
-python3 -m py_compile "$rhythm_forge_root/app/engine.py" "$rhythm_forge_root/app/progression.py" "$rhythm_forge_root/app/rhythm_forge.py"
+python3 -m py_compile "$rhythm_forge_root/app/engine.py" "$rhythm_forge_root/app/progression.py" "$rhythm_forge_root/app/rhythm_forge.py" "$rhythm_forge_root/app/downloader.py"
 bash -n \
   "$rhythm_forge_root/app/check-dependencies" \
   "$rhythm_forge_root/app/rhythm-forge" \

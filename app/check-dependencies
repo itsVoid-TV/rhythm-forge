@@ -27,6 +27,18 @@ elif ! timeout 5s python3 -I -c \
 fi
 
 command -v yt-dlp >/dev/null 2>&1 || add_package yt-dlp
+# Share the version-aware runtime probe with the actual downloader. Node is
+# explicitly enabled by the loader; yt-dlp otherwise enables only Deno.
+if command -v python3 >/dev/null 2>&1 && ! timeout 8s python3 \
+  "${BASH_SOURCE[0]%/*}/downloader.py" --check-runtime >/dev/null 2>&1; then
+  add_package deno
+fi
+# Arch's yt-dlp package needs its matching EJS package. Standalone/pip builds
+# may bundle EJS themselves, so do not infer their state from pacman alone.
+yt_dlp_binary="$(command -v yt-dlp 2>/dev/null || true)"
+if [[ -n "$yt_dlp_binary" ]] && [[ "$(pacman -Qqo "$yt_dlp_binary" 2>/dev/null)" == yt-dlp ]]; then
+  pacman -Qq yt-dlp-ejs >/dev/null 2>&1 || add_package yt-dlp-ejs
+fi
 if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
   add_package ffmpeg
 fi

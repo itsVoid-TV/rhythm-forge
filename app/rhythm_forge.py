@@ -33,11 +33,12 @@ from engine import (
     validate_video_url,
 )
 from progression import COLOR_GROUPS, COLOR_PRICE, ProgressionStore, advancement_rank
+from downloader import BROWSERS, download_error, download_options
 
 
 APP_ID = "io.github.omarchy.rhythmforge"
 APP_NAME = "Rhythm Forge"
-VERSION = "1.0.14"
+VERSION = "1.0.15"
 MAX_DURATION_SECONDS = MAX_MEDIA_DURATION_SECONDS
 BEATMAP_VERSION = 6
 MAX_METADATA_BYTES = 64 * 1024
@@ -176,13 +177,15 @@ class BoundedLineTail:
 
 
 class TrackLoader:
-    def __init__(self, url: str, status, progress, complete, failed, cancel_event: threading.Event) -> None:
+    def __init__(self, url: str, status, progress, complete, failed, cancel_event: threading.Event,
+                 browser: str | None = None) -> None:
         self.url = url
         self.status = status
         self.progress = progress
         self.complete = complete
         self.failed = failed
         self.cancel_event = cancel_event
+        self.browser = browser
 
     def emit(self, callback, *args) -> None:
         GLib.idle_add(callback, *args)
@@ -193,15 +196,13 @@ class TrackLoader:
             if not yt_dlp:
                 raise RuntimeError("yt-dlp is unavailable. Reopen Rhythm Forge from the bar to check dependencies.")
 
+            self.emit(self.status, "Checking the downloader…")
+            options = download_options(self.browser, cancel_event=self.cancel_event)
             self.emit(self.status, "Reading video information…")
             metadata_code, metadata_stdout, metadata_stderr = run_bounded_process(
                 [
                     yt_dlp,
-                    "--ignore-config",
-                    "--no-playlist",
-                    "--socket-timeout", "15",
-                    "--retries", "3",
-                    "--no-warnings",
+                    *options,
                     "--print", "%(.{id,extractor_key,title,artist,uploader,duration})j",
                     "--",
                     self.url,
@@ -231,12 +232,8 @@ class TrackLoader:
                 output_template = str(track_dir / "track.%(ext)s")
                 command = [
                     yt_dlp,
-                    "--ignore-config",
-                    "--no-playlist",
+                    *options,
                     "--newline",
-                    "--no-warnings",
-                    "--socket-timeout", "15",
-                    "--retries", "3",
                     "--fragment-retries", "3",
                     "--retry-sleep", "1",
                     "--max-filesize", "750M",
@@ -306,10 +303,12 @@ class TrackLoader:
 
     @staticmethod
     def find_media(track_dir: Path) -> Path | None:
-        ignored = {".part", ".ytdl", ".json"}
+        # A failed merge can leave track.f137.mp4 / track.f140.m4a behind.
+        # Only the final output basename is a reusable game copy.
+        complete_names = {"track.mp4", "track.mkv", "track.webm", "track.mov", "track.flv", "track.avi", "track.ogv"}
         candidates = [
             path for path in track_dir.glob("track.*")
-            if path.is_file() and path.suffix.lower() not in ignored and path.stat().st_size > 0
+            if path.name in complete_names and path.is_file() and path.stat().st_size > 0
         ]
         return max(candidates, key=lambda path: path.stat().st_mtime_ns) if candidates else None
 
@@ -336,11 +335,7 @@ class TrackLoader:
 
     @staticmethod
     def clean_error(output: str, fallback: str) -> str:
-        lines = [line.strip() for line in output.splitlines() if line.strip()]
-        useful = next((line for line in reversed(lines) if "ERROR:" in line), "")
-        if useful:
-            return useful.replace("ERROR:", "", 1).strip()
-        return lines[-1][:300] if lines else fallback
+        return download_error(output, fallback)
 
 
 class RhythmForgeWindow(Gtk.ApplicationWindow):
@@ -439,6 +434,17 @@ class RhythmForgeWindow(Gtk.ApplicationWindow):
         self.url_entry.set_input_purpose(Gtk.InputPurpose.URL)
         self.url_entry.connect("activate", lambda _entry: self.load_track())
 
+        browser_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        browser_label = Gtk.Label(label="Browser session", xalign=0)
+        browser_label.set_hexpand(True)
+        self.browser_session = Gtk.DropDown.new_from_strings(["No browser session", *[name.title() for name in BROWSERS]])
+        self.browser_session.set_tooltip_text("Optional: let yt-dlp read this browser's cookies while selected. Resets when the app closes.")
+        browser_row.append(browser_label)
+        browser_row.append(self.browser_session)
+        browser_hint = Gtk.Label(label="Optional for videos that require sign-in. Uses cookies from the selected browser for downloads.", xalign=0)
+        browser_hint.add_css_class("subtitle")
+        browser_hint.set_wrap(True)
+
         self.load_button = Gtk.Button(label="Download & Analyze")
         self.load_button.add_css_class("accent-button")
         self.load_button.connect("clicked", lambda _button: self.load_track())
@@ -460,7 +466,7 @@ class RhythmForgeWindow(Gtk.ApplicationWindow):
         self.ready_box.append(self.track_label)
         self.ready_box.append(self.start_button)
 
-        for child in (prompt, self.url_entry, self.load_button, self.progress, self.status_label, self.ready_box):
+        for child in (prompt, self.url_entry, browser_row, browser_hint, self.load_button, self.progress, self.status_label, self.ready_box):
             card.append(child)
 
         self.recent_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -871,6 +877,7 @@ class RhythmForgeWindow(Gtk.ApplicationWindow):
         self.loader_active = True
         self.load_button.set_sensitive(False)
         self.url_entry.set_sensitive(False)
+        self.browser_session.set_sensitive(False)
         self.ready_box.set_visible(False)
         self.progress.set_fraction(0.02)
         self.progress.set_visible(True)
@@ -884,6 +891,7 @@ class RhythmForgeWindow(Gtk.ApplicationWindow):
             self.track_ready,
             self.show_load_error,
             self.loader_cancel_event,
+            browser=BROWSERS[self.browser_session.get_selected() - 1] if self.browser_session.get_selected() else None,
         )
         threading.Thread(target=worker.run, name="track-loader", daemon=True).start()
 
@@ -899,6 +907,7 @@ class RhythmForgeWindow(Gtk.ApplicationWindow):
         self.loader_active = False
         self.load_button.set_sensitive(True)
         self.url_entry.set_sensitive(True)
+        self.browser_session.set_sensitive(True)
         self.progress.set_visible(False)
         self.status_label.add_css_class("error")
         self.status_label.set_text(sanitize_external_text(message, "The operation failed.", MAX_UI_ERROR_LENGTH))
@@ -916,6 +925,7 @@ class RhythmForgeWindow(Gtk.ApplicationWindow):
         self.loader_active = False
         self.load_button.set_sensitive(True)
         self.url_entry.set_sensitive(True)
+        self.browser_session.set_sensitive(True)
         self.progress.set_fraction(1.0)
         self.status_label.remove_css_class("error")
         self.status_label.set_text(f"Ready — {len(notes)} playable blocks across {int(duration // 60)}:{int(duration % 60):02d}.")
