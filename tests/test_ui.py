@@ -22,18 +22,24 @@ if os.environ.get("RHYTHM_FORGE_REQUIRE_GTK_TESTS") == "1" and not GTK_AVAILABLE
 
 @unittest.skipUnless(GTK_AVAILABLE, "GTK 4 and a display are required (CI uses Xvfb)")
 class SetupSmokeTests(unittest.TestCase):
-    def setUp(self):
+    @classmethod
+    def setUpClass(cls):
         import rhythm_forge
-        self.launcher = rhythm_forge
+        cls.launcher = rhythm_forge
+        # GApplication keeps its exported D-Bus object after a window closes.
+        # Register once and create a fresh window/cache for each test.
+        cls.app = Gtk.Application(application_id="io.github.omarchy.rhythmforge.test",
+                                  flags=Gio.ApplicationFlags.NON_UNIQUE)
+        cls.app.register(None)
+        cls.addClassCleanup(cls.app.quit)
+
+    def setUp(self):
         fixture = tempfile.TemporaryDirectory()
         self.addCleanup(fixture.cleanup)
         env = patch.dict(os.environ, {"XDG_CACHE_HOME": fixture.name})
         env.start()
         self.addCleanup(env.stop)
-        self.app = Gtk.Application(application_id="io.github.omarchy.rhythmforge.test",
-                                   flags=Gio.ApplicationFlags.NON_UNIQUE)
-        self.app.register(None)
-        self.window = rhythm_forge.RhythmForgeWindow(self.app)
+        self.window = self.launcher.RhythmForgeWindow(self.app)
         self.addCleanup(self.window.destroy)
 
     def test_browser_session_is_opt_in_and_passed_to_worker(self):
